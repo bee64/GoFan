@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"os/exec"
+	"os/user"
 	"strconv"
 	"strings"
 	"time"
@@ -9,67 +11,90 @@ import (
 	rpio "github.com/stianeikeland/go-rpio/v4"
 )
 
-const INTERVAL = 5 // wait time between temp checks in seconds
+const UP_INTERVAL = 5    // seconds between temp checks when getting hot
+const DOWN_INTERVAL = 30 // seconds (in addition to UP) when cooling
+const CYCLE = 10         // bigger cycle length allows more fine grained control
 
-func readCmd(cmd *exec.Cmd, name string) string {
-	cmdOutput, err := cmd.Output()
-	must(name, err)
-	return strings.Trim(string(cmdOutput), "\n")
+const MAX_TEMP = 80
+const MIN_TEMP = 60 // temp when fan starts spinning
+const TEMP_RANGE = MAX_TEMP / MIN_TEMP
+
+var BACKGROUND = os.Getenv("BACKGROUND")
+
+func getTemp() int {
+	tempBytes, err := exec.Command("vcgencmd", "measure_temp").Output()
+	must("read temp", err)
+	// "temp=12.3'C" => 12
+	temp := strings.Trim(string(tempBytes), "\n")
+	temp = strings.ReplaceAll(temp, "temp=", "")
+	temp = strings.ReplaceAll(temp, "'C", "")
+	temp = strings.Split(temp, ".")[0]
+	tempNum, err := strconv.Atoi(temp)
+	must("convert temp to string", err)
+	return tempNum
 }
 
-func getHighestTemp() int {
-	// read & parse GPU temp: "temp=12.3'C" => 12
-	gpuTemp := readCmd(exec.Command("vcgencmd", "measure_temp"), "read gpu temp")
-	gpuTemp = strings.ReplaceAll(gpuTemp, "temp=", "")
-	gpuTemp = strings.ReplaceAll(gpuTemp, "'C", "")
-	gpuTemp = strings.Split(gpuTemp, ".")[0]
-	gpuTempNum, err := strconv.Atoi(gpuTemp)
-	must("convert gpu temp to string", err)
-
-	// read & parse CPU temp: 12345 => 12
-	// 	=> 12345 is 12.345'C
-	cpuTemp := readCmd(exec.Command("cat", "/sys/class/thermal/thermal_zone0/temp"), "read cpu temp")
-	cpuTempNum, err := strconv.Atoi(cpuTemp)
-	must("convert cpu temp to string", err)
-	cpuTempNum /= 1000
-
-	if gpuTempNum > cpuTempNum {
-		return gpuTempNum
+func getFanSpeed(temp int) uint32 {
+	if temp <= MIN_TEMP {
+		return 0
+	} else if temp >= MAX_TEMP {
+		return CYCLE
 	} else {
-		return cpuTempNum
+		fanSpeed := (temp - MIN_TEMP) / TEMP_RANGE
+		if fanSpeed == 1 {
+			// min fanspeed of 20%, 10% is kinda ineffective
+			return 2
+		}
+		return uint32(fanSpeed)
 	}
 }
 
 func main() {
+	checkRootUser()
 	must("Open RPIO connection", rpio.Open())
 	defer rpio.Close()
-	pinPWM := rpio.Pin(18)
+	pin := rpio.Pin(18)
+	pin.Pwm()
+	pin.Freq(25000 * CYCLE) // 25kHz for Noctua fan control
+	pin.DutyCycle(0, CYCLE) // start with fan off
 
-	highTemp := getHighestTemp()
-	println("highest temp: " + strconv.Itoa(highTemp) + "C")
+	lastFanSpeed := uint32(0)
+	for {
+		highTemp := getTemp()
+		fanSpeed := getFanSpeed(highTemp)
+		log("fan speed: " + strconv.FormatUint(uint64(fanSpeed*10), 10) + "%")
+		log("temp:      " + strconv.Itoa(highTemp) + "C\n")
 
-	// pinPWM.Output()
-	// pinPWM.High()
-	pinPWM.Pwm()
-	pinPWM.Freq(25000 * 4) // 25kHz for Noctua fan control
-
-	println("1")
-	pinPWM.DutyCycle(1, 4)
-	wait()
-	println("2")
-	pinPWM.DutyCycle(2, 4)
-	wait()
-	println("4")
-	pinPWM.DutyCycle(4, 4)
-	wait()
-	println("off")
-	pinPWM.DutyCycle(0, 4)
-	wait()
-	// println("0")
+		// longer "cooldown hysteresis"
+		if fanSpeed < lastFanSpeed {
+			log("downward hysteresis wait")
+			wait(DOWN_INTERVAL)
+		}
+		pin.DutyCycle(fanSpeed, CYCLE)
+		lastFanSpeed = fanSpeed
+		wait(UP_INTERVAL)
+	}
 }
 
-func wait() {
-	time.Sleep(time.Second * INTERVAL)
+// helper functions
+
+func checkRootUser() {
+	currentUser, err := user.Current()
+	must("check current user", err)
+	if currentUser.Username != "root" {
+		println("PWM fan control needs to be run as root, try `sudo`")
+		os.Exit(0)
+	}
+}
+
+func wait(seconds time.Duration) {
+	time.Sleep(time.Second * seconds)
+}
+
+func log(message string) {
+	if BACKGROUND == "" {
+		println(message)
+	}
 }
 
 // TODO alerting
@@ -78,9 +103,3 @@ func must(task string, err error) {
 		panic(task + " error: " + err.Error())
 	}
 }
-
-// pins used by the fan that don't need programmatic control
-// pin5V  := rpio.Pin(4) // could use pin 2 as well
-// pin3V  := rpio.Pin(17) // could use pin 1 as well
-// pinGND := rpio.Pin(6)
-// pinPWM := rpio.Pin(12) // GPIO 18
